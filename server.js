@@ -127,7 +127,108 @@ app.put('/api/v1/clients/:id', (req, res) => {
 
   /* ---------- Update code below ----------*/
 
+  const oldStatus = client.status;
+  const oldPriority = client.priority;
+  const statusProvided = status !== undefined && status !== null && status !== '';
+  const priorityProvided = priority !== undefined && priority !== null && priority !== '';
 
+  if (!statusProvided && !priorityProvided) {
+    return res.status(200).send(clients);
+  }
+
+  if (statusProvided) {
+    if (status !== 'backlog' && status !== 'in-progress' && status !== 'complete') {
+      return res.status(400).send({
+        'message': 'Invalid status provided.',
+        'long_message': 'Status can only be one of the following: [backlog | in-progress | complete].',
+      });
+    }
+  } else {
+    status = oldStatus;
+  }
+
+  if (priorityProvided) {
+    priority = parseInt(priority, 10);
+    const { valid: priorityValid, messageObj: priorityMessageObj } = validatePriority(priority);
+    if (!priorityValid) {
+      return res.status(400).send(priorityMessageObj);
+    }
+    if (priority < 1) {
+      return res.status(400).send({
+        'message': 'Invalid priority provided.',
+        'long_message': 'Priority can only be positive integer.',
+      });
+    }
+  }
+
+  // Same status with no priority change requested -> nothing to do
+  if (status === oldStatus && !priorityProvided) {
+    return res.status(200).send(clients);
+  }
+
+  const updateClient = db.transaction(() => {
+    if (status === oldStatus) {
+      // Reorder within the same swimlane
+      const maxPriority = clients
+        .filter(c => c.status === status)
+        .reduce((max, c) => Math.max(max, c.priority), 0);
+      let newPriority = Math.min(priority, maxPriority);
+
+      if (newPriority === oldPriority) {
+        return;
+      }
+
+      if (newPriority < oldPriority) {
+        // Moving up: shift clients in [newPriority, oldPriority) down (+1)
+        db.prepare(`
+          UPDATE clients
+          SET priority = priority + 1
+          WHERE status = ? AND priority >= ? AND priority < ? AND id != ?
+        `).run(status, newPriority, oldPriority, id);
+      } else {
+        // Moving down: shift clients in (oldPriority, newPriority] up (-1)
+        db.prepare(`
+          UPDATE clients
+          SET priority = priority - 1
+          WHERE status = ? AND priority <= ? AND priority > ? AND id != ?
+        `).run(status, newPriority, oldPriority, id);
+      }
+
+      db.prepare('UPDATE clients SET priority = ? WHERE id = ?').run(newPriority, id);
+      return;
+    }
+
+    // Moving to a different swimlane: close the gap in the old swimlane
+    db.prepare(`
+      UPDATE clients
+      SET priority = priority - 1
+      WHERE status = ? AND priority > ?
+    `).run(oldStatus, oldPriority);
+
+    const destinationClients = db.prepare(
+      'SELECT * FROM clients WHERE status = ? ORDER BY priority ASC'
+    ).all(status);
+    const maxPriority = destinationClients.reduce((max, c) => Math.max(max, c.priority), 0);
+
+    let newPriority;
+    if (!priorityProvided) {
+      // No priority given: place at the end (lowest priority / biggest number)
+      newPriority = maxPriority + 1;
+    } else {
+      newPriority = Math.min(priority, maxPriority + 1);
+      db.prepare(`
+        UPDATE clients
+        SET priority = priority + 1
+        WHERE status = ? AND priority >= ?
+      `).run(status, newPriority);
+    }
+
+    db.prepare('UPDATE clients SET status = ?, priority = ? WHERE id = ?')
+      .run(status, newPriority, id);
+  });
+
+  updateClient();
+  clients = db.prepare('select * from clients').all();
 
   return res.status(200).send(clients);
 });
